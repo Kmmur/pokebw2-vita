@@ -12,6 +12,11 @@
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
+#elif defined(POKEBW2_VITA)
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+#include <unistd.h>
+extern void VitaLog_Printf(const char *fmt, ...);
 #else
 #include <unistd.h>
 #endif
@@ -20,6 +25,9 @@ enum { BACKUP_SIZE = 512 * 1024, LOCK_COUNT = 128 };
 static u8 backup[BACKUP_SIZE];
 static char *backup_path;
 static SDL_IOStream *backup_file;
+#ifdef POKEBW2_VITA
+static SceUID vita_backup_fd = -1;
+#endif
 static CARDResult result;
 static bool lock_ids[LOCK_COUNT];
 static SDL_SpinLock lock_guard;
@@ -34,6 +42,9 @@ static bool PathMissing(const char *path) {
     DWORD error = GetLastError();
     SDL_free(wide);
     return attributes == INVALID_FILE_ATTRIBUTES && (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND);
+#elif defined(POKEBW2_VITA)
+    SceIoStat st;
+    return sceIoGetstat(path, &st) < 0;
 #else
     struct stat info;
     return lstat(path, &info) != 0 && errno == ENOENT;
@@ -65,6 +76,36 @@ static BOOL CreateBackup(void) {
     }
     SDL_free(temporary_w);
     SDL_free(path_w);
+#elif defined(POKEBW2_VITA)
+    (void)fd;
+    sceIoMkdir("ux0:data/pokebw2", 0777);
+    SceUID vfd = sceIoOpen(temporary, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (vfd >= 0) {
+        int wr = sceIoWrite(vfd, backup, sizeof(backup));
+        int cl = sceIoClose(vfd);
+        complete = (wr == (int)sizeof(backup) && cl >= 0);
+        if (complete) {
+            sceIoRemove(backup_path);
+            if (sceIoRename(temporary, backup_path) < 0) {
+                SceUID dfd = sceIoOpen(backup_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+                if (dfd >= 0) {
+                    complete = (sceIoWrite(dfd, backup, sizeof(backup)) == (int)sizeof(backup) && sceIoClose(dfd) >= 0);
+                } else {
+                    complete = FALSE;
+                }
+            }
+        }
+        sceIoRemove(temporary);
+    }
+    SDL_free(temporary);
+    if (!complete) {
+        VitaLog_Printf("save: CreateBackup FAILED for %s", backup_path);
+        return SDL_SetError("Could not initialize Vita save file");
+    }
+    if (vita_backup_fd >= 0) { sceIoClose(vita_backup_fd); vita_backup_fd = -1; }
+    vita_backup_fd = sceIoOpen(backup_path, SCE_O_RDWR, 0777);
+    VitaLog_Printf("save: CreateBackup OK (%s, fd=0x%08x)", backup_path, (unsigned)vita_backup_fd);
+    return vita_backup_fd >= 0;
 #else
     fd = open(temporary, O_CREAT | O_EXCL | O_WRONLY, 0600);
     if (fd >= 0) {
@@ -79,11 +120,13 @@ static BOOL CreateBackup(void) {
         unlink(temporary);
     }
 #endif
+#ifndef POKEBW2_VITA
     SDL_free(temporary);
     if (!complete)
         return SDL_SetError("Could not initialize save file without replacing existing data");
     backup_file = SDL_IOFromFile(backup_path, "r+b");
     return backup_file != NULL;
+#endif
 }
 
 BOOL PcCard_OpenBackup(const char *path) {
@@ -96,6 +139,26 @@ BOOL PcCard_OpenBackup(const char *path) {
         PcCard_CloseBackup();
         return FALSE;
     }
+#ifdef POKEBW2_VITA
+    (void)info;
+    SceIoStat vst;
+    if (sceIoGetstat(path, &vst) >= 0) {
+        if (SCE_S_ISDIR(vst.st_mode) || vst.st_size < BACKUP_SIZE || vst.st_size > BACKUP_SIZE + 544) {
+            VitaLog_Printf("save: unsupported existing save size (%lld), recreating cleanly", (long long)vst.st_size);
+            sceIoRemove(path);
+        } else {
+            vita_backup_fd = sceIoOpen(path, SCE_O_RDWR, 0777);
+            if (vita_backup_fd < 0 || sceIoRead(vita_backup_fd, backup, sizeof(backup)) != (int)sizeof(backup)) {
+                VitaLog_Printf("save: failed to read existing save (fd=0x%08x)", (unsigned)vita_backup_fd);
+                PcCard_CloseBackup();
+                return FALSE;
+            }
+            VitaLog_Printf("save: loaded existing %s (%lld bytes)", path, (long long)vst.st_size);
+        }
+    } else {
+        VitaLog_Printf("save: no existing save at %s (will create on first save)", path);
+    }
+#else
     if (SDL_GetPathInfo(path, &info)) {
         if (info.type != SDL_PATHTYPE_FILE || (info.size < BACKUP_SIZE || info.size > BACKUP_SIZE + 544)) {
             PcCard_CloseBackup();
@@ -110,10 +173,17 @@ BOOL PcCard_OpenBackup(const char *path) {
         PcCard_CloseBackup();
         return SDL_SetError("Could not inspect existing save path: %s", path);
     }
+#endif
     result = CARD_RESULT_SUCCESS;
     return TRUE;
 }
 void PcCard_CloseBackup(void) {
+#ifdef POKEBW2_VITA
+    if (vita_backup_fd >= 0) {
+        sceIoClose(vita_backup_fd);
+        vita_backup_fd = -1;
+    }
+#endif
     if (backup_file)
         SDL_CloseIO(backup_file);
     if (backup_mutex)
@@ -167,6 +237,27 @@ BOOL CARDi_RequestStreamCommand(uptr src, uptr dest, u32 size, MIDmaCallback cal
             SDL_memcpy((void *)dest, backup + offset, size);
             result = CARD_RESULT_SUCCESS;
         } else if (request == CARD_REQ_WRITE_BACKUP && src) {
+#ifdef POKEBW2_VITA
+            if (vita_backup_fd < 0)
+                CreateBackup();
+            result = CARD_RESULT_FAILURE;
+            if (vita_backup_fd >= 0 &&
+                sceIoLseek(vita_backup_fd, (SceOff)offset, SCE_SEEK_SET) >= 0 &&
+                sceIoWrite(vita_backup_fd, (const void *)src, (SceSize)size) == (int)size) {
+                SDL_memcpy(backup + offset, (const void *)src, size);
+                result = CARD_RESULT_SUCCESS;
+                if (mode == CARD_REQUEST_MODE_SEND_VERIFY) {
+                    if (sceIoLseek(vita_backup_fd, (SceOff)offset, SCE_SEEK_SET) < 0 ||
+                        sceIoRead(vita_backup_fd, backup + offset, (SceSize)size) != (int)size ||
+                        SDL_memcmp(backup + offset, (const void *)src, size) != 0) {
+                        VitaLog_Printf("save: verify failed at off=0x%x sz=%u", (unsigned)offset, (unsigned)size);
+                        result = CARD_RESULT_FAILURE;
+                    }
+                }
+            } else {
+                VitaLog_Printf("save: write failed fd=0x%08x off=0x%x sz=%u", (unsigned)vita_backup_fd, (unsigned)offset, (unsigned)size);
+            }
+#else
             // A short initial write must not leave a truncated save at the final path.
             if (!backup_file)
                 CreateBackup();
@@ -182,6 +273,7 @@ BOOL CARDi_RequestStreamCommand(uptr src, uptr dest, u32 size, MIDmaCallback cal
                         result = CARD_RESULT_FAILURE;
                 }
             }
+#endif
         }
     }
     // The desktop write completes synchronously; callbacks still precede the original GFL completion check.
@@ -215,9 +307,15 @@ static void SettingsPutWord(u8 *data, u32 value) {
         data[i] = (u8)(value >> (8 * i));
 }
 static BOOL ReadSettingsRecord(unsigned slot, u8 *record) {
+#ifdef POKEBW2_VITA
+    return vita_backup_fd >= 0 && sceIoLseek(vita_backup_fd, (SceOff)(BACKUP_SIZE + slot * 272), SCE_SEEK_SET) >= 0 &&
+           sceIoRead(vita_backup_fd, record, 272) == 272 && SDL_memcmp(record, "BW2PCSET", 8) == 0 &&
+           SettingsWord(record + 268) == SettingsChecksum(record);
+#else
     return backup_file && SDL_SeekIO(backup_file, BACKUP_SIZE + slot * 272, SDL_IO_SEEK_SET) >= 0 &&
            SDL_ReadIO(backup_file, record, 272) == 272 && SDL_memcmp(record, "BW2PCSET", 8) == 0 &&
            SettingsWord(record + 268) == SettingsChecksum(record);
+#endif
 }
 static int LatestSettings(u8 records[2][272]) {
     BOOL first = ReadSettingsRecord(0, records[0]), second = ReadSettingsRecord(1, records[1]);
@@ -243,6 +341,18 @@ BOOL PcCard_WriteSettings(const void *data, u32 size) {
         return SDL_SetError("Save is not open");
     u8 records[2][272], record[272] = { 0 };
     SDL_LockMutex(backup_mutex);
+#ifdef POKEBW2_VITA
+    BOOL ok = vita_backup_fd >= 0 || CreateBackup();
+    int previous = LatestSettings(records);
+    unsigned slot = previous == 0 ? 1 : 0;
+    SDL_memcpy(record, "BW2PCSET", 8);
+    SettingsPutWord(record + 8, previous < 0 ? 1 : SettingsWord(records[previous] + 8) + 1);
+    SDL_memcpy(record + 12, data, size);
+    SettingsPutWord(record + 268, SettingsChecksum(record));
+    if (ok)
+        ok = sceIoLseek(vita_backup_fd, (SceOff)(BACKUP_SIZE + slot * 272), SCE_SEEK_SET) >= 0 &&
+             sceIoWrite(vita_backup_fd, record, sizeof(record)) == (int)sizeof(record);
+#else
     BOOL ok = backup_file != NULL || CreateBackup();
     int previous = LatestSettings(records);
     unsigned slot = previous == 0 ? 1 : 0;
@@ -253,6 +363,7 @@ BOOL PcCard_WriteSettings(const void *data, u32 size) {
     if (ok)
         ok = SDL_SeekIO(backup_file, BACKUP_SIZE + slot * 272, SDL_IO_SEEK_SET) >= 0 &&
              SDL_WriteIO(backup_file, record, sizeof(record)) == sizeof(record) && SDL_FlushIO(backup_file);
+#endif
     SDL_UnlockMutex(backup_mutex);
     return ok;
 }

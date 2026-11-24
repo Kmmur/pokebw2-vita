@@ -43,6 +43,7 @@ GXVRamBG GX_GetBankForBG(void) {
 void GX_SetBankForTex(GXVRamTex banks) {
     bankTex = banks;
     CopyCapturedBanks(PcGx.textures, banks, true);
+    PcGxTexGen++;
 }
 GXVRamTex GX_ResetBankForTex(void) {
     GXVRamTex previous = bankTex;

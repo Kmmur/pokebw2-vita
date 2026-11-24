@@ -23,4 +23,5 @@ void PcSequence_Modulation(unsigned player, unsigned mask, int depth, int speed)
 bool PcSequence_ReplaceWave(PcSoundResource archive, unsigned index, PcSoundResource source, unsigned source_index);
 void PcSequence_ClearWaveReplacements(void);
 void PcSequence_Render(float *stereo, size_t frames);
+void PcSequence_GetPlayerDebug(unsigned player, bool *active, bool *paused, unsigned *vol);
 #endif

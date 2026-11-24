@@ -2,6 +2,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 PcGxFrame PcGx;
 u16 PcGxPower;
@@ -10,6 +13,7 @@ u16 PcGxDisplay3D;
 u16 PcGx1DotDepth;
 PcGxRasterState PcGxRaster;
 u32 PcGxMainDisplay, PcGxSubDisplay;
+u32 PcGxTexGen = 1, PcGxPlttGen = 1;
 PcGx2DMemory PcGx2D[2];
 PcGx2DRegisters PcGxRegisters[2];
 u8 PcGxBackground[2][524288];
@@ -133,36 +137,82 @@ typedef struct {
     float m[4][4];
 } Matrix;
 static struct {
-    Matrix projection, position, vector, texture;
+    Matrix projection, position, vector, texture, clip_mtx;
     Matrix position_stack[32], vector_stack[32], projection_stack, texture_stack;
     u32 mode, stack, primitive, polygon, texparam, palette, diffuse_ambient, specular_emission;
     u32 commands, pending, arguments[32], argument_count, direct_op;
     float position_xyz[3], uv[2], base_uv[2], color[3], lights[4][3], light_colors[4][3];
+    float mat_diffuse[3], mat_ambient[3], mat_specular[3], mat_emission[3];
     float shininess[128];
     PcGxVertex primitive_vertices[4];
     unsigned primitive_count;
+    bool clip_dirty;
 } gx;
 
 static Matrix Identity(void) {
     Matrix m = { 0 };
-    for (int i = 0; i < 4; i++)
-        m.m[i][i] = 1;
+    m.m[0][0] = 1.0f;
+    m.m[1][1] = 1.0f;
+    m.m[2][2] = 1.0f;
+    m.m[3][3] = 1.0f;
     return m;
 }
-static Matrix Multiply(Matrix a, Matrix b) {
-    Matrix out = { 0 };
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++)
-            for (int k = 0; k < 4; k++)
-                out.m[i][j] += a.m[i][k] * b.m[k][j];
-    return out;
-}
-static void Transform(const float in[4], Matrix m, float out[4]) {
-    for (int j = 0; j < 4; j++) {
-        out[j] = 0;
-        for (int i = 0; i < 4; i++)
-            out[j] += in[i] * m.m[i][j];
+static void MultiplyInto(const Matrix *a, const Matrix *b, Matrix *out) {
+#ifdef __ARM_NEON
+    float32x4_t b0 = vld1q_f32(b->m[0]);
+    float32x4_t b1 = vld1q_f32(b->m[1]);
+    float32x4_t b2 = vld1q_f32(b->m[2]);
+    float32x4_t b3 = vld1q_f32(b->m[3]);
+    for (int i = 0; i < 4; i++) {
+        float32x4_t r = vmulq_n_f32(b0, a->m[i][0]);
+        r = vmlaq_n_f32(r, b1, a->m[i][1]);
+        r = vmlaq_n_f32(r, b2, a->m[i][2]);
+        r = vmlaq_n_f32(r, b3, a->m[i][3]);
+        vst1q_f32(out->m[i], r);
     }
+#else
+    Matrix tmp = { 0 };
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) {
+            float aik = a->m[i][k];
+            for (int j = 0; j < 4; j++)
+                tmp.m[i][j] += aik * b->m[k][j];
+        }
+    *out = tmp;
+#endif
+}
+static inline void Transform(const float in[4], const Matrix *m, float out[4]) {
+#ifdef __ARM_NEON
+    float32x4_t r = vmulq_n_f32(vld1q_f32(m->m[0]), in[0]);
+    r = vmlaq_n_f32(r, vld1q_f32(m->m[1]), in[1]);
+    r = vmlaq_n_f32(r, vld1q_f32(m->m[2]), in[2]);
+    r = vmlaq_n_f32(r, vld1q_f32(m->m[3]), in[3]);
+    vst1q_f32(out, r);
+#else
+    float x = in[0], y = in[1], z = in[2], w = in[3];
+    for (int j = 0; j < 4; j++)
+        out[j] = x * m->m[0][j] + y * m->m[1][j] + z * m->m[2][j] + w * m->m[3][j];
+#endif
+}
+static inline void TransformPos3(const float in[3], const Matrix *m, float out[4]) {
+#ifdef __ARM_NEON
+    float32x4_t r = vld1q_f32(m->m[3]);
+    r = vmlaq_n_f32(r, vld1q_f32(m->m[0]), in[0]);
+    r = vmlaq_n_f32(r, vld1q_f32(m->m[1]), in[1]);
+    r = vmlaq_n_f32(r, vld1q_f32(m->m[2]), in[2]);
+    vst1q_f32(out, r);
+#else
+    float x = in[0], y = in[1], z = in[2];
+    for (int j = 0; j < 4; j++)
+        out[j] = x * m->m[0][j] + y * m->m[1][j] + z * m->m[2][j] + m->m[3][j];
+#endif
+}
+static inline const Matrix *ClipMatrix(void) {
+    if (gx.clip_dirty) {
+        MultiplyInto(&gx.position, &gx.projection, &gx.clip_mtx);
+        gx.clip_dirty = false;
+    }
+    return &gx.clip_mtx;
 }
 static Matrix *Current(void) {
     return gx.mode == 0 ? &gx.projection : gx.mode == 3 ? &gx.texture : &gx.position;
@@ -172,106 +222,92 @@ static void Fail(const char *reason, u32 value) {
         snprintf(PcGx.error, sizeof(PcGx.error), "%s: 0x%x", reason, value);
     PcGx.failed = true;
 }
-static void Color(u32 packed, float out[3]) {
-    for (int i = 0; i < 3; i++)
-        out[i] = ((packed >> (i * 5)) & 31) / 31.0f;
+static inline void Color(u32 packed, float out[3]) {
+    const float inv31 = 1.0f / 31.0f;
+    out[0] = (float)(packed & 31u) * inv31;
+    out[1] = (float)((packed >> 5) & 31u) * inv31;
+    out[2] = (float)((packed >> 10) & 31u) * inv31;
 }
-static float Signed10(u32 word) {
+static inline float Signed10(u32 word) {
     return (float)((s32)(word << 22) >> 22);
 }
-static void Triangle(PcGxVertex a, PcGxVertex b, PcGxVertex c) {
+static inline void Triangle(const PcGxVertex *a, const PcGxVertex *b, const PcGxVertex *c) {
     if (PcGx.vertex_count + 3 > PC_GX_MAX_VERTICES) {
         Fail("Geometry capacity exceeded", PcGx.vertex_count);
         return;
     }
-    PcGx.vertices[PcGx.vertex_count++] = a;
-    PcGx.vertices[PcGx.vertex_count++] = b;
-    PcGx.vertices[PcGx.vertex_count++] = c;
+    PcGxVertex *dst = &PcGx.vertices[PcGx.vertex_count];
+    dst[0] = *a;
+    dst[1] = *b;
+    dst[2] = *c;
+    PcGx.vertex_count += 3;
 }
 static void Vertex(void) {
-    PcGxVertex v = { .texture = gx.texparam, .palette = gx.palette, .polygon = gx.polygon };
-    float local[4] = { gx.position_xyz[0], gx.position_xyz[1], gx.position_xyz[2], 1 }, eye[4];
-    Transform(local, gx.position, eye);
-    Transform(eye, gx.projection, v.clip);
+    unsigned n = gx.primitive_count++;
+    PcGxVertex *p = gx.primitive_vertices;
+    PcGxVertex *v = &p[n & 3u];
+    v->texture = gx.texparam;
+    v->palette = gx.palette;
+    v->polygon = gx.polygon;
+    TransformPos3(gx.position_xyz, ClipMatrix(), v->clip);
     if (PcGx.wide_scene)
-        v.clip[0] *= PcGx.projection_scale_x;
-    v.uv[0] = gx.uv[0];
-    v.uv[1] = gx.uv[1];
+        v->clip[0] *= PcGx.projection_scale_x;
+    v->uv[0] = gx.uv[0];
+    v->uv[1] = gx.uv[1];
     if ((gx.texparam >> 30) == 3) {
         float tex[4];
-        Transform(local, gx.texture, tex);
-        v.uv[0] += tex[0];
-        v.uv[1] += tex[1];
+        TransformPos3(gx.position_xyz, &gx.texture, tex);
+        v->uv[0] += tex[0];
+        v->uv[1] += tex[1];
     }
-    memcpy(v.color, gx.color, sizeof(gx.color));
-    v.color[3] = ((gx.polygon >> 16) & 31) / 31.0f;
-    unsigned n = gx.primitive_count++;
-    gx.primitive_vertices[n % 4] = v;
-    PcGxVertex *p = gx.primitive_vertices;
-    if (gx.primitive == 0 && n % 3 == 2) {
-        Triangle(p[(n - 2) % 4], p[(n - 1) % 4], v);
-    } else if (gx.primitive == 1 && n % 4 == 3) {
-        Triangle(p[0], p[1], p[2]);
-        Triangle(p[0], p[2], p[3]);
-    } else if (gx.primitive == 2 && n >= 2) {
-        Triangle(p[(n - 2 + (n & 1)) % 4], p[(n - 1 - (n & 1)) % 4], v);
-    } else if (gx.primitive == 3 && n >= 3 && (n & 1)) {
-        Triangle(p[(n - 3) % 4], p[(n - 2) % 4], v);
-        Triangle(p[(n - 3) % 4], v, p[(n - 1) % 4]);
+    v->color[0] = gx.color[0];
+    v->color[1] = gx.color[1];
+    v->color[2] = gx.color[2];
+    u32 poly_a = (gx.polygon >> 16) & 31u;
+    v->color[3] = poly_a ? ((float)poly_a * (1.0f / 31.0f)) : 1.0f;
+    if (gx.primitive == 0) {
+        if (n % 3 == 2)
+            Triangle(&p[(n - 2) & 3u], &p[(n - 1) & 3u], v);
+    } else if (gx.primitive == 1) {
+        if ((n & 3u) == 3u) {
+            Triangle(&p[0], &p[1], &p[2]);
+            Triangle(&p[0], &p[2], &p[3]);
+        }
+    } else if (gx.primitive == 2) {
+        if (n >= 2)
+            Triangle(&p[(n - 2 + (n & 1u)) & 3u], &p[(n - 1 - (n & 1u)) & 3u], v);
+    } else if (gx.primitive == 3) {
+        if (n >= 3 && (n & 1u)) {
+            Triangle(&p[(n - 3) & 3u], &p[(n - 2) & 3u], v);
+            Triangle(&p[(n - 3) & 3u], v, &p[(n - 1) & 3u]);
+        }
     }
 }
-static unsigned ArgumentCount(u32 op) {
-    switch (op) {
-    case 0:
-    case 0x11:
-    case 0x15:
-    case 0x41:
-        return 0;
-    case 0x16:
-    case 0x18:
-        return 16;
-    case 0x17:
-    case 0x19:
-        return 12;
-    case 0x1a:
-        return 9;
-    case 0x1b:
-    case 0x1c:
-    case 0x70:
-        return 3;
-    case 0x23:
-    case 0x71:
-        return 2;
-    case 0x34:
-        return 32;
-    case 0x10:
-    case 0x12:
-    case 0x13:
-    case 0x14:
-    case 0x20:
-    case 0x21:
-    case 0x22:
-    case 0x24:
-    case 0x25:
-    case 0x26:
-    case 0x27:
-    case 0x28:
-    case 0x29:
-    case 0x2a:
-    case 0x2b:
-    case 0x30:
-    case 0x31:
-    case 0x32:
-    case 0x33:
-    case 0x40:
-    case 0x50:
-    case 0x60:
-    case 0x72:
-        return 1;
-    default:
-        Fail("Unknown geometry command", op);
-        return 0;
-    }
+static const u8 gx_arg_count_lut[256] = {
+    [0x00] = 0,
+    [0x10] = 1, [0x11] = 0, [0x12] = 1, [0x13] = 1, [0x14] = 1, [0x15] = 0,
+    [0x16] = 16, [0x17] = 12, [0x18] = 16, [0x19] = 12, [0x1a] = 9, [0x1b] = 3, [0x1c] = 3,
+    [0x20] = 1, [0x21] = 1, [0x22] = 1, [0x23] = 2, [0x24] = 1, [0x25] = 1, [0x26] = 1,
+    [0x27] = 1, [0x28] = 1, [0x29] = 1, [0x2a] = 1, [0x2b] = 1,
+    [0x30] = 1, [0x31] = 1, [0x32] = 1, [0x33] = 1, [0x34] = 32,
+    [0x40] = 1, [0x41] = 0, [0x50] = 1, [0x60] = 1,
+    [0x70] = 3, [0x71] = 2, [0x72] = 1,
+};
+static const u8 gx_op_valid_lut[256] = {
+    [0x00] = 1,
+    [0x10] = 1, [0x11] = 1, [0x12] = 1, [0x13] = 1, [0x14] = 1, [0x15] = 1,
+    [0x16] = 1, [0x17] = 1, [0x18] = 1, [0x19] = 1, [0x1a] = 1, [0x1b] = 1, [0x1c] = 1,
+    [0x20] = 1, [0x21] = 1, [0x22] = 1, [0x23] = 1, [0x24] = 1, [0x25] = 1, [0x26] = 1,
+    [0x27] = 1, [0x28] = 1, [0x29] = 1, [0x2a] = 1, [0x2b] = 1,
+    [0x30] = 1, [0x31] = 1, [0x32] = 1, [0x33] = 1, [0x34] = 1,
+    [0x40] = 1, [0x41] = 1, [0x50] = 1, [0x60] = 1,
+    [0x70] = 1, [0x71] = 1, [0x72] = 1,
+};
+static inline unsigned ArgumentCount(u32 op) {
+    if (op < 256 && gx_op_valid_lut[op])
+        return gx_arg_count_lut[op];
+    Fail("Unknown geometry command", op);
+    return 0;
 }
 static void Execute(u32 op, const u32 *a) {
     Matrix *current = Current();
@@ -298,6 +334,7 @@ static void Execute(u32 op, const u32 *a) {
         if (gx.mode == 0) {
             gx.projection = gx.projection_stack;
             PcGxStatus &= ~REG_G3X_GXSTAT_PJ_MASK;
+            gx.clip_dirty = true;
         } else if (gx.mode == 3)
             gx.texture = gx.texture_stack;
         else {
@@ -306,6 +343,7 @@ static void Execute(u32 op, const u32 *a) {
             gx.position = gx.position_stack[gx.stack];
             gx.vector = gx.vector_stack[gx.stack];
             PcGxStatus = (PcGxStatus & ~REG_G3X_GXSTAT_PV_MASK) | (gx.stack << REG_G3X_GXSTAT_PV_SHIFT);
+            gx.clip_dirty = true;
         }
         break;
     case 0x13:
@@ -319,19 +357,23 @@ static void Execute(u32 op, const u32 *a) {
         }
         break;
     case 0x14:
-        if (gx.mode == GX_MTXMODE_PROJECTION)
+        if (gx.mode == GX_MTXMODE_PROJECTION) {
             gx.projection = gx.projection_stack;
-        else if (gx.mode == GX_MTXMODE_TEXTURE)
+            gx.clip_dirty = true;
+        } else if (gx.mode == GX_MTXMODE_TEXTURE)
             gx.texture = gx.texture_stack;
         else {
             gx.position = gx.position_stack[a[0] & 31];
             gx.vector = gx.vector_stack[a[0] & 31];
+            gx.clip_dirty = true;
         }
         break;
     case 0x15:
         *current = Identity();
         if (gx.mode == 2)
             gx.vector = Identity();
+        if (gx.mode != 3)
+            gx.clip_dirty = true;
         break;
     case 0x16:
     case 0x17:
@@ -340,73 +382,112 @@ static void Execute(u32 op, const u32 *a) {
     case 0x1a: {
         Matrix m = Identity();
         unsigned rows = op == 0x1a ? 3 : 4, cols = op == 0x16 || op == 0x18 ? 4 : 3;
+        const float inv4096 = 1.0f / 4096.0f;
         for (unsigned i = 0; i < rows; i++)
             for (unsigned j = 0; j < cols; j++)
-                m.m[i][j] = (s32)a[i * cols + j] / 4096.0f;
+                m.m[i][j] = (float)(s32)a[i * cols + j] * inv4096;
         bool load = op == 0x16 || op == 0x17;
-        *current = load ? m : Multiply(m, *current);
+        if (load) {
+            *current = m;
+        } else {
+            Matrix res;
+            MultiplyInto(&m, current, &res);
+            *current = res;
+        }
         if (gx.mode == 2) {
             m.m[3][0] = m.m[3][1] = m.m[3][2] = 0;
-            gx.vector = load ? m : Multiply(m, gx.vector);
+            if (load) {
+                gx.vector = m;
+            } else {
+                Matrix res;
+                MultiplyInto(&m, &gx.vector, &res);
+                gx.vector = res;
+            }
         }
+        if (gx.mode != 3)
+            gx.clip_dirty = true;
         break;
     }
-    case 0x1b:
+    case 0x1b: {
+        const float inv4096 = 1.0f / 4096.0f;
+        float sx = (float)(s32)a[0] * inv4096;
+        float sy = (float)(s32)a[1] * inv4096;
+        float sz = (float)(s32)a[2] * inv4096;
+        for (int j = 0; j < 4; j++) {
+            current->m[0][j] *= sx;
+            current->m[1][j] *= sy;
+            current->m[2][j] *= sz;
+        }
+        if (gx.mode != 3)
+            gx.clip_dirty = true;
+        break;
+    }
     case 0x1c: {
-        Matrix m = Identity();
-        for (int i = 0; i < 3; i++)
-            m.m[op == 0x1b ? i : 3][i] = (s32)a[i] / 4096.0f;
-        *current = Multiply(m, *current);
+        const float inv4096 = 1.0f / 4096.0f;
+        float tx = (float)(s32)a[0] * inv4096;
+        float ty = (float)(s32)a[1] * inv4096;
+        float tz = (float)(s32)a[2] * inv4096;
+        for (int j = 0; j < 4; j++)
+            current->m[3][j] += tx * current->m[0][j] + ty * current->m[1][j] + tz * current->m[2][j];
+        if (gx.mode != 3)
+            gx.clip_dirty = true;
         break;
     }
     case 0x20:
         Color(a[0], gx.color);
         break;
     case 0x21: {
-        float local[4] = { Signed10(a[0]) / 512, Signed10(a[0] >> 10) / 512, Signed10(a[0] >> 20) / 512, 0 }, normal[4];
-        Transform(local, gx.vector, normal);
-        float diffuse[3], ambient[3], specular[3], emission[3];
-        Color(gx.diffuse_ambient, diffuse);
-        Color(gx.diffuse_ambient >> 16, ambient);
-        Color(gx.specular_emission, specular);
-        Color(gx.specular_emission >> 16, emission);
-        memcpy(gx.color, emission, sizeof(emission));
-        for (int light = 0; light < 4; light++)
-            if (gx.polygon & (1u << light)) {
-                float dot = 0, halfdot = 0;
-                for (int i = 0; i < 3; i++) {
-                    dot -= normal[i] * gx.lights[light][i];
-                    halfdot -= normal[i] * (gx.lights[light][i] + (i == 2 ? -1 : 0)) * 0.5f;
+        const float inv512 = 1.0f / 512.0f;
+        float local[4] = { Signed10(a[0]) * inv512, Signed10(a[0] >> 10) * inv512, Signed10(a[0] >> 20) * inv512, 0.0f }, normal[4];
+        Transform(local, &gx.vector, normal);
+        gx.color[0] = gx.mat_emission[0];
+        gx.color[1] = gx.mat_emission[1];
+        gx.color[2] = gx.mat_emission[2];
+        u32 lmask = gx.polygon & 0xFu;
+        if (lmask) {
+            for (int light = 0; light < 4; light++) {
+                if (lmask & (1u << light)) {
+                    const float *ld = gx.lights[light];
+                    float dot = -(normal[0] * ld[0] + normal[1] * ld[1] + normal[2] * ld[2]);
+                    float halfdot = (dot + normal[2]) * 0.5f;
+                    float shine = halfdot > 0.0f ? halfdot * halfdot : 0.0f;
+                    if (gx.specular_emission & 0x8000) {
+                        int idx = (int)(shine * 128.0f);
+                        if (idx > 127) idx = 127;
+                        shine = gx.shininess[idx];
+                    }
+                    float dpos = dot > 0.0f ? dot : 0.0f;
+                    const float *lc = gx.light_colors[light];
+                    gx.color[0] += lc[0] * (gx.mat_ambient[0] + gx.mat_diffuse[0] * dpos + gx.mat_specular[0] * shine);
+                    gx.color[1] += lc[1] * (gx.mat_ambient[1] + gx.mat_diffuse[1] * dpos + gx.mat_specular[1] * shine);
+                    gx.color[2] += lc[2] * (gx.mat_ambient[2] + gx.mat_diffuse[2] * dpos + gx.mat_specular[2] * shine);
                 }
-                float shine = fmaxf(0, halfdot);
-                shine *= shine;
-                if (gx.specular_emission & 0x8000)
-                    shine = gx.shininess[(unsigned)fminf(127, shine * 128)];
-                for (int i = 0; i < 3; i++)
-                    gx.color[i] +=
-                        gx.light_colors[light][i] * (ambient[i] + diffuse[i] * fmaxf(0, dot) + specular[i] * shine);
             }
-        for (int i = 0; i < 3; i++)
-            gx.color[i] = fminf(1, gx.color[i]);
+            if (gx.color[0] > 1.0f) gx.color[0] = 1.0f;
+            if (gx.color[1] > 1.0f) gx.color[1] = 1.0f;
+            if (gx.color[2] > 1.0f) gx.color[2] = 1.0f;
+        }
         if ((gx.texparam >> 30) == 2) {
             float tex[4];
-            Transform(local, gx.texture, tex);
+            Transform(local, &gx.texture, tex);
             gx.uv[0] = gx.base_uv[0] + tex[0];
             gx.uv[1] = gx.base_uv[1] + tex[1];
         }
         break;
     }
     case 0x22: {
-        float uv[4] = { (s16)a[0] / 16.0f, (s16)(a[0] >> 16) / 16.0f, 1.0f / 16, 1.0f / 16 }, transformed[4];
-        gx.base_uv[0] = uv[0];
-        gx.base_uv[1] = uv[1];
+        float u = (float)(s16)a[0] * (1.0f / 16.0f);
+        float v = (float)(s16)(a[0] >> 16) * (1.0f / 16.0f);
+        gx.base_uv[0] = u;
+        gx.base_uv[1] = v;
         if ((gx.texparam >> 30) == 1) {
-            Transform(uv, gx.texture, transformed);
+            float uv[4] = { u, v, 1.0f / 16.0f, 1.0f / 16.0f }, transformed[4];
+            Transform(uv, &gx.texture, transformed);
             gx.uv[0] = transformed[0];
             gx.uv[1] = transformed[1];
         } else {
-            gx.uv[0] = uv[0];
-            gx.uv[1] = uv[1];
+            gx.uv[0] = u;
+            gx.uv[1] = v;
         }
         break;
     }
@@ -444,15 +525,23 @@ static void Execute(u32 op, const u32 *a) {
         break;
     case 0x30:
         gx.diffuse_ambient = a[0];
-        if (a[0] & 0x8000)
-            Color(a[0], gx.color);
+        Color(a[0], gx.mat_diffuse);
+        Color(a[0] >> 16, gx.mat_ambient);
+        if (a[0] & 0x8000) {
+            gx.color[0] = gx.mat_diffuse[0];
+            gx.color[1] = gx.mat_diffuse[1];
+            gx.color[2] = gx.mat_diffuse[2];
+        }
         break;
     case 0x31:
         gx.specular_emission = a[0];
+        Color(a[0], gx.mat_specular);
+        Color(a[0] >> 16, gx.mat_emission);
         break;
     case 0x32: {
-        float v[4] = { Signed10(a[0]) / 512, Signed10(a[0] >> 10) / 512, Signed10(a[0] >> 20) / 512, 0 }, out[4];
-        Transform(v, gx.vector, out);
+        const float inv512 = 1.0f / 512.0f;
+        float v[4] = { Signed10(a[0]) * inv512, Signed10(a[0] >> 10) * inv512, Signed10(a[0] >> 20) * inv512, 0.0f }, out[4];
+        Transform(v, &gx.vector, out);
         memcpy(gx.lights[a[0] >> 30], out, 3 * sizeof(float));
         break;
     }
@@ -474,13 +563,14 @@ static void Execute(u32 op, const u32 *a) {
     case 0x70: {
         s16 box[6] = { (s16)a[0], (s16)(a[0] >> 16), (s16)a[1], (s16)(a[1] >> 16), (s16)a[2], (s16)(a[2] >> 16) };
         unsigned outside_all = 63;
+        const Matrix *cm = ClipMatrix();
+        const float inv4096 = 1.0f / 4096.0f;
         for (unsigned corner = 0; corner < 8; corner++) {
-            float local[4] = { (box[0] + ((corner & 1) ? box[3] : 0)) / 4096.0f,
-                               (box[1] + ((corner & 2) ? box[4] : 0)) / 4096.0f,
-                               (box[2] + ((corner & 4) ? box[5] : 0)) / 4096.0f, 1 },
-                  eye[4], clip[4];
-            Transform(local, gx.position, eye);
-            Transform(eye, gx.projection, clip);
+            float local[3] = { (float)(box[0] + ((corner & 1) ? box[3] : 0)) * inv4096,
+                               (float)(box[1] + ((corner & 2) ? box[4] : 0)) * inv4096,
+                               (float)(box[2] + ((corner & 4) ? box[5] : 0)) * inv4096 },
+                  clip[4];
+            TransformPos3(local, cm, clip);
             if (PcGx.wide_scene)
                 clip[0] *= PcGx.projection_scale_x;
             unsigned outside = (clip[0] < -clip[3] ? 1u : 0u) | (clip[0] > clip[3] ? 2u : 0u) |
@@ -537,6 +627,52 @@ void PcGx_Write(uptr address, u32 value) {
         }
     }
 }
+void PcGx_WriteFifoWords(const u32 *words, u32 count) {
+    if (PcGx.failed || !count)
+        return;
+    u32 i = 0;
+    // Finish any partially-buffered command from a previous call
+    while (i < count && gx.commands && !PcGx.failed) {
+        u32 needed = ArgumentCount(gx.pending);
+        while (i < count && gx.argument_count < needed)
+            gx.arguments[gx.argument_count++] = words[i++];
+        if (gx.argument_count < needed)
+            return;
+        Execute(gx.pending, gx.arguments);
+        gx.argument_count = 0;
+        gx.commands >>= 8;
+        Advance();
+    }
+    // Fast direct streaming path: execute packed 4-op command words directly out of words[]
+    while (i < count && !PcGx.failed) {
+        u32 cmds = words[i++];
+        while (cmds) {
+            u32 op = cmds & 0xFFu;
+            if (!gx_op_valid_lut[op]) {
+                Fail("Unknown geometry command", op);
+                return;
+            }
+            u32 argc = gx_arg_count_lut[op];
+            if (argc == 0) {
+                if (op)
+                    Execute(op, gx.arguments);
+                cmds >>= 8;
+            } else if (i + argc <= count) {
+                Execute(op, &words[i]);
+                i += argc;
+                cmds >>= 8;
+            } else {
+                // Command arguments split across DMA/FIFO calls: save remainder
+                gx.commands = cmds;
+                gx.pending = op;
+                gx.argument_count = 0;
+                while (i < count)
+                    gx.arguments[gx.argument_count++] = words[i++];
+                return;
+            }
+        }
+    }
+}
 void PcGx_BeginFrame(void) {
     PcGx.vertex_count = 0;
     PcGx.composite_scene = false;
@@ -557,7 +693,8 @@ void PcGx_ResetHardware(void) {
     PcGx1DotDepth = 0;
     PcGx.wide_scene = false;
     PcGx.projection_scale_x = 0.75f;
-    gx.projection = gx.position = gx.vector = gx.texture = Identity();
+    gx.projection = gx.position = gx.vector = gx.texture = gx.clip_mtx = Identity();
+    gx.clip_dirty = false;
     for (int i = 0; i < 32; i++)
         gx.position_stack[i] = gx.vector_stack[i] = Identity();
     gx.projection_stack = gx.texture_stack = Identity();
@@ -566,7 +703,7 @@ void PcGx_ResetHardware(void) {
 }
 void PcGx_ReadClipMatrix(void *output) {
     MtxFx44 *dest = output;
-    Matrix clip = Multiply(gx.position, gx.projection);
+    Matrix clip = *ClipMatrix();
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
             dest->m[i][j] = (fx32)lrintf(clip.m[i][j] * 4096);
@@ -591,6 +728,7 @@ void GX_LoadTex(const void *src, u32 offset, u32 size) {
         return;
     }
     memcpy(PcGx.textures + offset, src, size);
+    PcGxTexGen++;
 }
 void GX_LoadTexPltt(const void *src, u32 offset, u32 size) {
     if (offset > sizeof(PcGx.palettes) || size > sizeof(PcGx.palettes) - offset) {
@@ -598,6 +736,7 @@ void GX_LoadTexPltt(const void *src, u32 offset, u32 size) {
         return;
     }
     memcpy(PcGx.palettes + offset, src, size);
+    PcGxPlttGen++;
 }
 void PcGx_ReadRearPlane(PcGxRearPixel pixels[256 * 192]) {
     bool image = (PcGxDisplay3D & REG_G3X_DISP3DCNT_PRI_MASK) != 0;

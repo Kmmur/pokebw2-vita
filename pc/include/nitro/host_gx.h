@@ -2,6 +2,8 @@
 #define POKEBW2_HOST_GX_H
 #include "types.h"
 void PcGx_Write(uptr address, u32 value);
+void PcGx_WriteFifoWords(const u32 *words, u32 count);
+extern u32 PcGxTexGen, PcGxPlttGen;
 extern u32 PcGxStatus;
 extern u32 PcGxMainDisplay, PcGxSubDisplay;
 extern u16 PcGxDisplay3D;

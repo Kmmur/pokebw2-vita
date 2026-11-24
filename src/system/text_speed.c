@@ -24,7 +24,16 @@ void saveMainSaveAreaAddress(SaveControl *save) {
     sSaveControl = save;
 }
 
+#ifdef POKEBW2_VITA
+extern u8 VitaSettings_EffectiveTextSpeed(void);
+#endif
+
 s32 TextSpeed_GetCurrentWait(void) {
+#ifdef POKEBW2_VITA
+    u8 ov = VitaSettings_EffectiveTextSpeed();
+    if (ov == 1) return -2;
+    if (ov == 2) return -16;
+#endif
     u32 speed = Config_GetTextSpeed(&getTrainerDataBlkAddress(sSaveControl)->config);
 
     if (speed >= TEXT_SPEED_MAX) {

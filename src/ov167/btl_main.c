@@ -136,6 +136,10 @@ BOOL BtlMain_ProcInit(GameProc *proc, u32 *state, void *param, void *work) {
         if (!Config_GetBattleScene(setup->config)) {
             notInitialized = TRUE;
         }
+#ifdef POKEBW2_VITA
+        { extern u8 VitaSettings_EffectiveBattleAnimSpeed(void);
+          if (VitaSettings_EffectiveBattleAnimSpeed() == 2) notInitialized = FALSE; }
+#endif
         mainModule->battleSceneOff = (u8)notInitialized;
         mainModule->field = BtlField_Create(mainModule->heapId);
         PokeCon_Init(&mainModule->pokeCons[0], mainModule, FALSE);

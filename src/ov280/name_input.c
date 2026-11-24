@@ -508,7 +508,19 @@ const u32 NAME_ENTRY_SOUND_COUNT = 6;
 // How fast the key highlight blinks
 static u32 sKeyBlinkStep = 0x51e;
 
+#ifdef POKEBW2_VITA
+extern void VitaIme_ResetSession(void);
+extern BOOL VitaIme_WasTriggeredThisSession(void);
+extern BOOL VitaIme_IsActive(void);
+extern BOOL VitaIme_Open(const char *title_ascii, const u16 *initial_utf16, u32 max_len);
+extern BOOL VitaIme_ConsumeResult(u16 *out_utf16, u32 max_chars, BOOL *confirmed, BOOL *canceled);
+extern u8 VitaSettings_GetLayout(void);
+#endif
+
 BOOL NameEntry_ProcInit(GameProc *proc, u32 *state, void *arg, void *unused) {
+#ifdef POKEBW2_VITA
+    VitaIme_ResetSession();
+#endif
     NameEntryParam *param = arg;
     NameEntryWork *work;
     int keyboardType = 0;
@@ -3384,6 +3396,33 @@ static void NameEntryTask_Input(NameEntryTask *task, u32 *state, NameEntryWork *
 
     result = Keyboard_GetResult(&work->keyboard, &c);
     page = Keyboard_GetKanaPage(&work->keyboard);
+#ifdef POKEBW2_VITA
+    if (!VitaIme_IsActive()) {
+        BOOL auto_open = (VitaSettings_GetLayout() == 0) && !VitaIme_WasTriggeredThisSession();
+        BOOL manual_open = (GCTX_HIDGetPressedKeys() & PAD_BUTTON_SELECT) != 0;
+        if (auto_open || manual_open) {
+            const char *title = (work->param->mode == NAME_ENTRY_PLAYER) ? "Enter Your Name" :
+                                (work->param->mode == NAME_ENTRY_RIVAL) ? "Enter Rival Name" :
+                                (work->param->mode == NAME_ENTRY_POKEMON || work->param->mode == NAME_ENTRY_POKEMON_RENAME) ? "Enter Pokemon Nickname" :
+                                (work->param->mode == NAME_ENTRY_BOX) ? "Enter Box Name" : "Enter Text";
+            VitaIme_Open(title, work->box.text, work->param->maxLength);
+        }
+        {
+            u16 ime_buf[40];
+            BOOL ime_ok = FALSE, ime_cancel = FALSE;
+            if (VitaIme_ConsumeResult(ime_buf, 40, &ime_ok, &ime_cancel) && ime_ok && ime_buf[0] != 0) {
+                NameBox_Clear(&work->box);
+                for (u32 k = 0; ime_buf[k] != 0; k++) {
+                    u16 ch = ime_buf[k];
+                    if (ch >= 0x0020 && ch <= 0x007E)
+                        NameBox_AddChar(&work->box, ch);
+                }
+                if (NameBox_GetLength(&work->box) > 0)
+                    result = KEY_RESULT_OK;
+            }
+        }
+    }
+#endif
     if (work->messagePending == TRUE) {
         if (result != 0 || NameEntryIcon_WasTouched(&work->icon) || (GCTX_HIDGetPressedKeys() & ~PAD_BUTTON_A) != 0) {
             if (work->param->mode == NAME_ENTRY_POKEMON) {

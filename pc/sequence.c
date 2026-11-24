@@ -1,6 +1,7 @@
 #include "sequence.h"
 #include "audio.h"
 #include <SDL3/SDL.h>
+#include <math.h>
 #include <nitro/snd/common/bank.h>
 #include <nitro/snd/common/util.h>
 #include <nitro/snd/common/work.h>
@@ -16,10 +17,11 @@ typedef struct {
 static PcSequenceBank banks[SND_PLAYER_NUM];
 typedef struct {
     float *samples;
+    size_t capacity;
     size_t count, loopStart;
     double position, step;
     float gain, pan;
-    bool active, loop;
+    bool active, loop, is_pcm;
 } PcSoundChannel;
 static PcSoundChannel channels[SND_CHANNEL_NUM];
 static double tickPhase;
@@ -135,8 +137,17 @@ BOOL SND_NoteOn(SNDExChannel *channel, int key, int velocity, s32 length, const 
         }
         if (!Contains(wave, offset, 12))
             return FALSE;
-        SNDWaveParam shape;
-        SDL_memcpy(&shape, wave.data + offset, sizeof(shape));
+        // Under SDK_FROM_TOOL, SNDWaveParam.loopstart is u32 (offset 8, sizeof==16), while DS SWAV header is 12 bytes
+        // (u8 format, u8 loopflag, u16 rate, u16 timer, u16 loopstart, u32 looplen). Always unpack explicitly!
+        const uint8_t *w = wave.data + offset;
+        SNDWaveParam shape = {
+            .format = w[0],
+            .loopflag = w[1],
+            .rate = Read16(w + 2),
+            .timer = Read16(w + 4),
+            .loopstart = Read16(w + 6),
+            .looplen = Read32(w + 8),
+        };
         size_t bytes = ((size_t)shape.loopstart + shape.looplen) * 4;
         if (!Contains(wave, offset + 12, bytes) || shape.format > 2 || (shape.format == 2 && bytes < 4))
             return FALSE;
@@ -181,12 +192,19 @@ BOOL SND_IsChannelActive7(int channel) {
 }
 static bool AllocateChannel(int index, size_t count, int volume, SNDChannelDataShift shift, int timer, int pan) {
     PcSoundChannel *channel = &channels[index];
-    SDL_free(channel->samples);
-    SDL_zero(*channel);
-    channel->samples = SDL_calloc(count, sizeof(float));
-    if (!channel->samples)
-        return false;
+    if (count > channel->capacity) {
+        float *buf = SDL_realloc(channel->samples, count * sizeof(float));
+        if (!buf)
+            return false;
+        channel->samples = buf;
+        channel->capacity = count;
+    }
     channel->count = count;
+    channel->loopStart = 0;
+    channel->position = 0.0;
+    channel->active = false;
+    channel->loop = false;
+    channel->is_pcm = false;
     SND_SetChannelVolume7(index, volume, shift);
     SND_SetChannelTimer7(index, timer);
     SND_SetChannelPan7(index, pan);
@@ -200,6 +218,7 @@ void SND_SetupChannelPcm7(int index, const void *data, SNDWaveFormat format, SND
     if (!AllocateChannel(index, count, volume, shift, timer, pan))
         return;
     PcSoundChannel *channel = &channels[index];
+    channel->is_pcm = true;
     channel->loop = loop == SND_CHANNEL_LOOP_REPEAT;
     channel->loopStart = format == 0 ? loopStart * 4 : format == 1 ? loopStart * 2 : SDL_max(loopStart * 8 - 8, 0);
     int sample = format == 2 ? (int16_t)Read16(bytes) : 0;
@@ -277,6 +296,17 @@ bool PcSequence_Start(unsigned player, PcSoundResource sequence, PcSoundResource
 bool PcSequence_Active(unsigned player) {
     return player < SND_PLAYER_NUM && SNDi_Work.player[player].active_flag;
 }
+void PcSequence_GetPlayerDebug(unsigned player, bool *active, bool *paused, unsigned *vol) {
+    if (player >= SND_PLAYER_NUM) {
+        if (active) *active = false;
+        if (paused) *paused = false;
+        if (vol) *vol = 0;
+        return;
+    }
+    if (active) *active = SNDi_Work.player[player].active_flag != 0;
+    if (paused) *paused = SNDi_Work.player[player].pause_flag != 0;
+    if (vol) *vol = SNDi_Work.player[player].volume;
+}
 void PcSequence_ChannelMask(unsigned player, unsigned mask) {
     if (player < SND_PLAYER_NUM) {
         SND_SetTrackMute7(player, 0xffff, SND_SEQ_MUTE_OFF);
@@ -344,12 +374,22 @@ void PcSequence_Render(float *stereo, size_t frames) {
                 channel->position = channel->loopStart + SDL_fmod(channel->position - channel->loopStart,
                                                                   channel->count - channel->loopStart);
             }
-            float value = channel->samples[(size_t)channel->position] * channel->gain * 0.25f;
-            left += value * (1 - channel->pan);
+            size_t idx0 = (size_t)channel->position;
+            float s = channel->samples[idx0];
+            if (channel->is_pcm) {
+                float frac = (float)(channel->position - (double)idx0);
+                size_t idx1 = idx0 + 1;
+                if (idx1 >= channel->count)
+                    idx1 = (channel->loop && channel->loopStart < channel->count) ? channel->loopStart : idx0;
+                s += (channel->samples[idx1] - s) * frac;
+            }
+            float value = s * channel->gain * 0.25f;
+            left += value * (1.0f - channel->pan);
             right += value * channel->pan;
             channel->position += channel->step;
         }
-        stereo[frame * 2] = SDL_clamp(left, -1, 1);
-        stereo[frame * 2 + 1] = SDL_clamp(right, -1, 1);
+        // Keep full linear float headroom here; final stage applies single transparent peak protection.
+        stereo[frame * 2] = left;
+        stereo[frame * 2 + 1] = right;
     }
 }

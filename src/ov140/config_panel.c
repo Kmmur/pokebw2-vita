@@ -513,7 +513,7 @@ static BOOL ConfigPanel_Init(GameProc *proc, u32 *state, void *param, void *work
     MI_CpuFill8(wk, 0, sizeof(ConfigPanelWork));
     wk->param = param;
     wk->param->result = FALSE;
-#ifdef POKEBW2_PC
+#if defined(POKEBW2_PC) && !defined(POKEBW2_VITA)
     wk->font = GFL_FontCreate(ARCID_FONT, 0, 0, FALSE, HEAPID_CONFIG_PANEL);
     nativeWork = wk;
     nativeClosed = FALSE;
@@ -544,7 +544,7 @@ static BOOL ConfigPanel_Init(GameProc *proc, u32 *state, void *param, void *work
 static BOOL ConfigPanel_Exit(GameProc *proc, u32 *state, void *param, void *work) {
     ConfigPanelWork *wk = work;
 
-#ifdef POKEBW2_PC
+#if defined(POKEBW2_PC) && !defined(POKEBW2_VITA)
     nativeWork = NULL;
     GFL_FontFree(wk->font);
     GFL_ProcReleaseSubsystem(proc);
@@ -575,7 +575,7 @@ static BOOL ConfigPanel_Exit(GameProc *proc, u32 *state, void *param, void *work
 static BOOL ConfigPanel_Main(GameProc *proc, u32 *state, void *param, void *work) {
     ConfigPanelWork *wk = work;
 
-#ifdef POKEBW2_PC
+#if defined(POKEBW2_PC) && !defined(POKEBW2_VITA)
     return nativeClosed;
 #endif
     ConfigPanelSeq_Main(&wk->seq);

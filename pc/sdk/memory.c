@@ -114,12 +114,18 @@ void MI_UncompressLZ8(const void *src, void *dest) {
 
 void MIi_CpuSend32(const void *src, volatile void *dest, u32 size) {
     const u32 *words = src;
-    for (u32 i = 0; i < size / sizeof(u32); i++) {
-        if ((uptr)dest >= 0x04000400 && (uptr)dest < 0x04000600)
-            PcGx_Write((uptr)dest, words[i]);
-        else
-            *(volatile u32 *)dest = words[i];
+    u32 count = size / sizeof(u32);
+    if ((uptr)dest == 0x04000400) {
+        PcGx_WriteFifoWords(words, count);
+        return;
     }
+    if ((uptr)dest >= 0x04000400 && (uptr)dest < 0x04000600) {
+        for (u32 i = 0; i < count; i++)
+            PcGx_Write((uptr)dest, words[i]);
+        return;
+    }
+    for (u32 i = 0; i < count; i++)
+        *(volatile u32 *)dest = words[i];
 }
 void MIi_CpuCopy32(const void *src, void *dest, u32 size) {
     if (!size)
